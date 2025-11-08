@@ -1,12 +1,12 @@
 # dashboard.py
-# Advanced Customer Segmentation Streamlit Dashboard with Personas, Prediction, and Metrics
+# Streamlit Customer Segmentation Dashboard (Plotly-based, Pillow-free)
 import io
 import os
 import streamlit as st
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
 from sklearn.preprocessing import StandardScaler
 from sklearn.cluster import KMeans, DBSCAN, AgglomerativeClustering
 from sklearn.mixture import GaussianMixture
@@ -17,8 +17,8 @@ from sklearn.metrics import silhouette_score, confusion_matrix
 import warnings
 warnings.filterwarnings("ignore")
 
-st.set_page_config(page_title="Customer Segmentation Dashboard", layout="wide")
-st.title("Customer Segmentation Dashboard")
+st.set_page_config(page_title="PersonaVision — Customer Segmentation", layout="wide")
+st.title("PersonaVision — Smart Customer Segmentation & Profiling")
 
 # ---------------------------
 # Helper: Load and preprocess
@@ -61,7 +61,6 @@ def load_and_prepare_dataframe(uploaded_file):
     df = df.copy()
 
     # Create derived features safely
-    # Avoid division by zero for income
     df['Annual Income (k$)'] = pd.to_numeric(df['Annual Income (k$)'], errors='coerce')
     df['Spending Score (1-100)'] = pd.to_numeric(df['Spending Score (1-100)'], errors='coerce')
     df['Spending per Income'] = df.apply(
@@ -124,10 +123,6 @@ min_samples = st.sidebar.slider("DBSCAN min_samples", 3, 10, 5)
 # Clustering function
 # ---------------------------
 def get_cluster_labels(algorithm, X_scaled, n_clusters=5, eps=1.2, min_samples=5):
-    """
-    Return cluster labels for the given algorithm.
-    For GMM we use .predict on the fitted model to get labels.
-    """
     if algorithm == "KMeans":
         model = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
         labels = model.fit_predict(X_scaled)
@@ -151,11 +146,9 @@ df['Cluster'] = cluster_labels
 # Metrics: Silhouette (if valid)
 # ---------------------------
 def valid_silhouette(labels):
-    # silhouette requires at least 2 clusters (excluding noise label -1) and at least 2 samples per cluster
     unique_labels = [lab for lab in set(labels) if lab != -1]
     if len(unique_labels) < 2:
         return False
-    # check cluster sizes
     sizes = [np.sum(labels == lab) for lab in unique_labels]
     if min(sizes) < 2:
         return False
@@ -169,7 +162,7 @@ if valid_silhouette(cluster_labels):
         pass
 
 # ---------------------------
-# Dimensionality Reduction for Plot
+# Dimensionality Reduction for Plot (PCA)
 # ---------------------------
 pca = PCA(n_components=2)
 pca_result = pca.fit_transform(X_scaled)
@@ -177,23 +170,22 @@ df['PCA1'] = pca_result[:, 0]
 df['PCA2'] = pca_result[:, 1]
 
 # ---------------------------
-# Visualization: Clusters
+# Visualization: Clusters (Plotly)
 # ---------------------------
-st.subheader("Cluster Visualization")
-fig, ax = plt.subplots(figsize=(10, 6))
-# Ensure cluster labels are plotted cleanly (noise may exist as -1)
-sns.scatterplot(
-    data=df,
+st.subheader("Cluster Visualization (PCA projection)")
+# Convert cluster to string for color consistency
+df['_Cluster_str'] = df['Cluster'].astype(str)
+fig_scatter = px.scatter(
+    df,
     x='PCA1',
     y='PCA2',
-    hue='Cluster',
-    palette='tab10',
-    ax=ax,
-    legend='full',
-    s=60,
+    color='_Cluster_str',
+    labels={'_Cluster_str': 'Cluster'},
+    hover_data=[col for col in df.columns if col in ['Age', 'Annual Income (k$)', 'Spending Score (1-100)']],
+    title=f"{algorithm} Clustering Results (PCA-reduced)"
 )
-ax.set_title(f"{algorithm} Clustering Results (PCA-reduced)")
-st.pyplot(fig)
+fig_scatter.update_traces(marker=dict(size=8))
+st.plotly_chart(fig_scatter, use_container_width=True)
 
 # ---------------------------
 # Cluster Summary
@@ -210,7 +202,6 @@ else:
 # Personas & Business Insights
 # ---------------------------
 st.subheader("Segment Personas")
-# Keep personas generic — shown only if cluster id exists
 default_personas = {
     0: "Budget-Conscious Shoppers",
     1: "Mid-Income Moderate Spenders",
@@ -225,9 +216,8 @@ for cluster_id, description in default_personas.items():
 st.subheader("Business Recommendations")
 if 'Cluster' in df.columns and summary_cols:
     for i, row in avg_metrics.iterrows():
-        # Defensive indexing
-        inc = row[summary_cols[0]] if len(summary_cols) > 0 else 0
-        score = row[summary_cols[1]] if len(summary_cols) > 1 else 0
+        inc = float(row[summary_cols[0]]) if len(summary_cols) > 0 else 0.0
+        score = float(row[summary_cols[1]]) if len(summary_cols) > 1 else 0.0
         st.markdown(f"**Segment {i}:** Income = {inc:.1f}, Spending Score = {score:.1f}")
         if inc > 70 and score > 70:
             st.success("High-income, high-spender → Target with luxury promotions.")
@@ -241,7 +231,7 @@ else:
     st.info("Business recommendations require numeric columns (income & spending score).")
 
 # ---------------------------
-# Algorithm Comparison by Silhouette
+# Algorithm Comparison by Silhouette (Plotly Bar)
 # ---------------------------
 st.subheader("Algorithm Comparison (Silhouette Scores)")
 def compare_algorithms(X_scaled, n_clusters):
@@ -258,18 +248,12 @@ def compare_algorithms(X_scaled, n_clusters):
     return scores
 
 algo_scores = compare_algorithms(X_scaled, num_clusters)
-# Show bar chart safely
 if any(v is not None for v in algo_scores.values()):
-    fig_score, ax_score = plt.subplots()
-    keys = []
-    vals = []
-    for k, v in algo_scores.items():
-        keys.append(k)
-        vals.append(v if v is not None else 0)
-    ax_score.bar(keys, vals, color='skyblue')
-    ax_score.set_ylabel("Silhouette Score (None shown as 0)")
-    ax_score.set_title("Algorithm Performance Comparison")
-    st.pyplot(fig_score)
+    keys = list(algo_scores.keys())
+    vals = [v if v is not None else 0 for v in algo_scores.values()]
+    fig_bar = px.bar(x=keys, y=vals, labels={'x':'Algorithm','y':'Silhouette Score'},
+                     title='Algorithm Performance Comparison')
+    st.plotly_chart(fig_bar, use_container_width=True)
 else:
     st.info("Not enough valid clusters for algorithm comparison.")
 
@@ -278,7 +262,6 @@ else:
 # ---------------------------
 if algorithm != "DBSCAN" and len(set(cluster_labels)) > 1:
     st.subheader("Predict Segment for New Customer")
-    # prepare training data (exclude noise if any)
     valid_idx = np.where(cluster_labels != -1)[0]
     if len(valid_idx) >= 2:
         X_valid = X_scaled[valid_idx]
@@ -290,15 +273,20 @@ if algorithm != "DBSCAN" and len(set(cluster_labels)) > 1:
             accuracy = clf.score(X_test, y_test)
             st.metric("Classifier Accuracy", f"{accuracy * 100:.2f}%")
 
-            # Confusion matrix
+            # Confusion matrix (Plotly)
             y_pred = clf.predict(X_test)
-            fig_cm, ax_cm = plt.subplots()
             cm = confusion_matrix(y_test, y_pred)
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax_cm)
-            ax_cm.set_xlabel("Predicted")
-            ax_cm.set_ylabel("True")
-            ax_cm.set_title("Confusion Matrix")
-            st.pyplot(fig_cm)
+            fig_cm = go.Figure(data=go.Heatmap(
+                z=cm,
+                x=[f"Pred_{c}" for c in np.unique(y_test)],
+                y=[f"True_{c}" for c in np.unique(y_test)],
+                colorscale='Blues',
+                showscale=True,
+                text=cm,
+                texttemplate="%{text}"
+            ))
+            fig_cm.update_layout(title="Confusion Matrix", xaxis_title="Predicted", yaxis_title="True")
+            st.plotly_chart(fig_cm, use_container_width=True)
 
             # Input fields for single prediction
             st.markdown("**Predict segment for a new single customer**")
@@ -307,11 +295,10 @@ if algorithm != "DBSCAN" and len(set(cluster_labels)) > 1:
             gender = st.selectbox("Gender", ["Female", "Male"])
             age = st.number_input("Age", min_value=1, max_value=120, value=30, step=1)
 
-            # Prepare input row consistent with features
             spi = (score / income) if income != 0 else 0
             age_group_label = pd.cut([age], bins=[0, 30, 45, 60, 120], labels=['Young', 'Adult', 'Mid-Aged', 'Senior'])[0]
 
-            # Construct input record aligned to features
+            # Construct input aligned to features
             input_data = {}
             for f in features:
                 if f == 'Annual Income (k$)':
@@ -321,18 +308,10 @@ if algorithm != "DBSCAN" and len(set(cluster_labels)) > 1:
                 elif f == 'Spending per Income':
                     input_data[f] = spi
                 elif f.startswith('Gender_'):
-                    # e.g., Gender_Male -> set 1 for Male when selected
-                    if f == f"Gender_{gender}":
-                        input_data[f] = 1
-                    else:
-                        input_data[f] = 0
+                    input_data[f] = 1 if f == f"Gender_{gender}" else 0
                 elif f.startswith('Age Group_'):
-                    # map label names to column format used earlier 'Age Group_Adult'
                     col_label = f.replace('Age Group_', '')
-                    if str(age_group_label) == col_label:
-                        input_data[f] = 1
-                    else:
-                        input_data[f] = 0
+                    input_data[f] = 1 if str(age_group_label) == col_label else 0
                 else:
                     input_data[f] = 0
 

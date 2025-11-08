@@ -1,5 +1,7 @@
+# dashboard.py
 # Advanced Customer Segmentation Streamlit Dashboard with Personas, Prediction, and Metrics
-
+import io
+import os
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,162 +20,333 @@ warnings.filterwarnings("ignore")
 st.set_page_config(page_title="Customer Segmentation Dashboard", layout="wide")
 st.title("Customer Segmentation Dashboard")
 
-# Load Data
-df = pd.read_csv("C:/Users/avnis/PycharmProjects/pythonProject1/Customer Segmentation Project/Mall_Customers.csv")
-df['Spending per Income'] = df['Spending Score (1-100)'] / df['Annual Income (k$)']
-df['Age Group'] = pd.cut(df['Age'], bins=[18, 30, 45, 60, 80], labels=['Young', 'Adult', 'Mid-Aged', 'Senior'])
-df = pd.get_dummies(df, columns=['Gender', 'Age Group'], drop_first=True)
+# ---------------------------
+# Helper: Load and preprocess
+# ---------------------------
+REQUIRED_COLUMNS = ['Age', 'Annual Income (k$)', 'Spending Score (1-100)', 'Gender']
 
-# Select Features
-features = ['Annual Income (k$)', 'Spending Score (1-100)', 'Spending per Income'] + [col for col in df.columns if 'Gender_' in col or 'Age Group_' in col]
-X = df[features]
-scaler = StandardScaler()
-X_scaled = scaler.fit_transform(X)
+def read_csv_from_upload(uploaded_file):
+    try:
+        bytes_data = uploaded_file.read()
+        return pd.read_csv(io.BytesIO(bytes_data))
+    except Exception as e:
+        st.error(f"Unable to read uploaded file: {e}")
+        return None
 
-# Sidebar Configuration
+def load_and_prepare_dataframe(uploaded_file):
+    """
+    Load CSV either from uploaded file or from repo root Mall_Customers.csv.
+    Preprocess: create Spending per Income, Age Group, one-hot encoding for Gender and Age Group.
+    Returns processed df, features list, scaler instance, and scaled X.
+    """
+    # Load
+    df = None
+    if uploaded_file is not None:
+        df = read_csv_from_upload(uploaded_file)
+    else:
+        local_path = os.path.join(os.path.dirname(__file__), "Mall_Customers.csv")
+        if os.path.exists(local_path):
+            df = pd.read_csv(local_path)
+        else:
+            st.error("No dataset found. Upload a CSV file or place 'Mall_Customers.csv' in the app folder.")
+            return None, None, None, None
+
+    # Basic validation
+    missing = [c for c in REQUIRED_COLUMNS if c not in df.columns]
+    if missing:
+        st.error(f"Dataset is missing required column(s): {missing}. Expected columns: {REQUIRED_COLUMNS}")
+        return None, None, None, None
+
+    # Copy to avoid modifying original
+    df = df.copy()
+
+    # Create derived features safely
+    # Avoid division by zero for income
+    df['Annual Income (k$)'] = pd.to_numeric(df['Annual Income (k$)'], errors='coerce')
+    df['Spending Score (1-100)'] = pd.to_numeric(df['Spending Score (1-100)'], errors='coerce')
+    df['Spending per Income'] = df.apply(
+        lambda row: (row['Spending Score (1-100)'] / row['Annual Income (k$)'])
+        if pd.notnull(row['Annual Income (k$)']) and row['Annual Income (k$)'] != 0 else 0,
+        axis=1
+    )
+
+    # Age group bucketing
+    try:
+        df['Age'] = pd.to_numeric(df['Age'], errors='coerce')
+        df['Age Group'] = pd.cut(df['Age'], bins=[0, 30, 45, 60, 120], labels=['Young', 'Adult', 'Mid-Aged', 'Senior'])
+    except Exception:
+        df['Age Group'] = 'Unknown'
+
+    # One-hot encoding for Gender and Age Group (drop_first to avoid collinearity)
+    df = pd.get_dummies(df, columns=['Gender', 'Age Group'], drop_first=True, dummy_na=False)
+
+    # Select features for clustering (keep order consistent)
+    feature_candidates = ['Annual Income (k$)', 'Spending Score (1-100)', 'Spending per Income']
+    encoded_cols = [col for col in df.columns if col.startswith('Gender_') or col.startswith('Age Group_')]
+    features = feature_candidates + encoded_cols
+
+    # Ensure features exist
+    features = [f for f in features if f in df.columns]
+
+    if len(features) < 3:
+        st.error("Not enough features available for clustering after preprocessing.")
+        return None, None, None, None
+
+    X = df[features].fillna(0)
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+
+    return df, features, scaler, X_scaled
+
+# ---------------------------
+# UI: Data Upload / Load
+# ---------------------------
+st.sidebar.header("Data")
+uploaded_file = st.sidebar.file_uploader("Upload Mall_Customers CSV", type=["csv"])
+st.sidebar.markdown("If no file is uploaded, the app will attempt to read `Mall_Customers.csv` from the app folder.")
+
+df, features, scaler, X_scaled = load_and_prepare_dataframe(uploaded_file)
+
+# If loading failed, stop further execution
+if df is None:
+    st.stop()
+
+# ---------------------------
+# Sidebar Configuration - Clustering
+# ---------------------------
 st.sidebar.header("Clustering Settings")
 algorithm = st.sidebar.selectbox("Select Clustering Algorithm", ["KMeans", "Agglomerative", "DBSCAN", "GMM"])
-num_clusters = st.sidebar.slider("Number of Clusters (for KMeans, Agglomerative, GMM)", 2, 10, 5)
+num_clusters = st.sidebar.slider("Number of Clusters (KMeans, Agglomerative, GMM)", 2, 10, 5)
 eps = st.sidebar.slider("DBSCAN eps (only used for DBSCAN)", 0.1, 5.0, 1.2, step=0.1)
+min_samples = st.sidebar.slider("DBSCAN min_samples", 3, 10, 5)
 
-# Clustering
-def get_cluster_labels(algorithm, X_scaled, n_clusters=5, eps=1.2):
+# ---------------------------
+# Clustering function
+# ---------------------------
+def get_cluster_labels(algorithm, X_scaled, n_clusters=5, eps=1.2, min_samples=5):
+    """
+    Return cluster labels for the given algorithm.
+    For GMM we use .predict on the fitted model to get labels.
+    """
     if algorithm == "KMeans":
-        model = KMeans(n_clusters=n_clusters, random_state=42)
+        model = KMeans(n_clusters=n_clusters, random_state=42, n_init='auto')
+        labels = model.fit_predict(X_scaled)
     elif algorithm == "Agglomerative":
         model = AgglomerativeClustering(n_clusters=n_clusters)
+        labels = model.fit_predict(X_scaled)
     elif algorithm == "GMM":
         model = GaussianMixture(n_components=n_clusters, random_state=42)
-        return model.fit_predict(X_scaled)
+        labels = model.fit_predict(X_scaled)
     elif algorithm == "DBSCAN":
-        model = DBSCAN(eps=eps, min_samples=5)
-    return model.fit_predict(X_scaled)
+        model = DBSCAN(eps=eps, min_samples=min_samples)
+        labels = model.fit_predict(X_scaled)
+    else:
+        labels = np.zeros(X_scaled.shape[0], dtype=int)
+    return labels
 
-cluster_labels = get_cluster_labels(algorithm, X_scaled, num_clusters, eps)
+cluster_labels = get_cluster_labels(algorithm, X_scaled, num_clusters, eps, min_samples)
 df['Cluster'] = cluster_labels
 
-# Clustering Metric: Silhouette Score
-if len(set(cluster_labels)) > 1 and -1 not in cluster_labels:
-    score = silhouette_score(X_scaled, cluster_labels)
-    st.metric(label="Silhouette Score", value=f"{score:.2f}")
+# ---------------------------
+# Metrics: Silhouette (if valid)
+# ---------------------------
+def valid_silhouette(labels):
+    # silhouette requires at least 2 clusters (excluding noise label -1) and at least 2 samples per cluster
+    unique_labels = [lab for lab in set(labels) if lab != -1]
+    if len(unique_labels) < 2:
+        return False
+    # check cluster sizes
+    sizes = [np.sum(labels == lab) for lab in unique_labels]
+    if min(sizes) < 2:
+        return False
+    return True
 
+if valid_silhouette(cluster_labels):
+    try:
+        score = silhouette_score(X_scaled, cluster_labels)
+        st.metric(label="Silhouette Score", value=f"{score:.2f}")
+    except Exception:
+        pass
+
+# ---------------------------
 # Dimensionality Reduction for Plot
+# ---------------------------
 pca = PCA(n_components=2)
 pca_result = pca.fit_transform(X_scaled)
 df['PCA1'] = pca_result[:, 0]
 df['PCA2'] = pca_result[:, 1]
 
-# Visualize Clusters
+# ---------------------------
+# Visualization: Clusters
+# ---------------------------
 st.subheader("Cluster Visualization")
 fig, ax = plt.subplots(figsize=(10, 6))
-sns.scatterplot(data=df, x='PCA1', y='PCA2', hue='Cluster', palette='tab10', ax=ax)
-plt.title(f"{algorithm} Clustering Results (PCA-reduced)")
+# Ensure cluster labels are plotted cleanly (noise may exist as -1)
+sns.scatterplot(
+    data=df,
+    x='PCA1',
+    y='PCA2',
+    hue='Cluster',
+    palette='tab10',
+    ax=ax,
+    legend='full',
+    s=60,
+)
+ax.set_title(f"{algorithm} Clustering Results (PCA-reduced)")
 st.pyplot(fig)
 
-# Cluster Averages
+# ---------------------------
+# Cluster Summary
+# ---------------------------
 st.subheader("Cluster Summary")
-avg_metrics = df.groupby('Cluster')[['Annual Income (k$)', 'Spending Score (1-100)', 'Spending per Income']].mean()
-st.dataframe(avg_metrics.style.format("{:.2f}"))
+summary_cols = [c for c in ['Annual Income (k$)', 'Spending Score (1-100)', 'Spending per Income'] if c in df.columns]
+if summary_cols:
+    avg_metrics = df.groupby('Cluster')[summary_cols].mean()
+    st.dataframe(avg_metrics.style.format("{:.2f}"))
+else:
+    st.info("Not enough columns available for cluster summaries.")
 
-# Business Personas
+# ---------------------------
+# Personas & Business Insights
+# ---------------------------
 st.subheader("Segment Personas")
-personas = {
+# Keep personas generic — shown only if cluster id exists
+default_personas = {
     0: "Budget-Conscious Shoppers",
     1: "Mid-Income Moderate Spenders",
     2: "Value Seekers",
     3: "Affluent Enthusiasts",
     4: "Passive Participants"
 }
-for cluster_id, description in personas.items():
+for cluster_id, description in default_personas.items():
     if cluster_id in df['Cluster'].unique():
         st.markdown(f"**Cluster {cluster_id}:** {description}")
 
-# Business Insights
 st.subheader("Business Recommendations")
-for i, row in avg_metrics.iterrows():
-    st.markdown(f"**Segment {i}:** Income = {row[0]:.1f}, Spending Score = {row[1]:.1f}")
-    if row[0] > 70 and row[1] > 70:
-        st.success("High-income, high-spender → Target with luxury promotions.")
-    elif row[0] < 40 and row[1] > 70:
-        st.warning("Low-income, high-spender → Offer discounts and loyalty programs.")
-    elif row[1] < 40:
-        st.info("Low spender → Consider engagement strategies or churn intervention.")
-    else:
-        st.info("Mid-range customer → Potential to grow with personalized offers.")
+if 'Cluster' in df.columns and summary_cols:
+    for i, row in avg_metrics.iterrows():
+        # Defensive indexing
+        inc = row[summary_cols[0]] if len(summary_cols) > 0 else 0
+        score = row[summary_cols[1]] if len(summary_cols) > 1 else 0
+        st.markdown(f"**Segment {i}:** Income = {inc:.1f}, Spending Score = {score:.1f}")
+        if inc > 70 and score > 70:
+            st.success("High-income, high-spender → Target with luxury promotions.")
+        elif inc < 40 and score > 70:
+            st.warning("Low-income, high-spender → Offer discounts and loyalty programs.")
+        elif score < 40:
+            st.info("Low spender → Consider engagement strategies or churn intervention.")
+        else:
+            st.info("Mid-range customer → Potential to grow with personalized offers.")
+else:
+    st.info("Business recommendations require numeric columns (income & spending score).")
 
-# Compare clustering algorithms by Silhouette Score
+# ---------------------------
+# Algorithm Comparison by Silhouette
+# ---------------------------
 st.subheader("Algorithm Comparison (Silhouette Scores)")
 def compare_algorithms(X_scaled, n_clusters):
     scores = {}
     for algo in ["KMeans", "Agglomerative", "GMM"]:
         try:
             labels = get_cluster_labels(algo, X_scaled, n_clusters)
-            if len(set(labels)) > 1 and -1 not in labels:
-                score = silhouette_score(X_scaled, labels)
-                scores[algo] = score
-        except:
+            if valid_silhouette(labels):
+                scores[algo] = float(silhouette_score(X_scaled, labels))
+            else:
+                scores[algo] = None
+        except Exception:
             scores[algo] = None
     return scores
 
 algo_scores = compare_algorithms(X_scaled, num_clusters)
-if algo_scores:
+# Show bar chart safely
+if any(v is not None for v in algo_scores.values()):
     fig_score, ax_score = plt.subplots()
-    ax_score.bar(algo_scores.keys(), algo_scores.values(), color='skyblue')
-    ax_score.set_ylabel("Silhouette Score")
+    keys = []
+    vals = []
+    for k, v in algo_scores.items():
+        keys.append(k)
+        vals.append(v if v is not None else 0)
+    ax_score.bar(keys, vals, color='skyblue')
+    ax_score.set_ylabel("Silhouette Score (None shown as 0)")
     ax_score.set_title("Algorithm Performance Comparison")
     st.pyplot(fig_score)
+else:
+    st.info("Not enough valid clusters for algorithm comparison.")
 
-# Train classifier to predict clusters (all except DBSCAN)
-if algorithm != "DBSCAN":
+# ---------------------------
+# Classifier: Train to predict clusters (exclude DBSCAN noise)
+# ---------------------------
+if algorithm != "DBSCAN" and len(set(cluster_labels)) > 1:
     st.subheader("Predict Segment for New Customer")
-    X_train, X_test, y_train, y_test = train_test_split(X_scaled, cluster_labels, test_size=0.2, random_state=42)
-    clf = RandomForestClassifier()
-    clf.fit(X_train, y_train)
-    y_pred = clf.predict(X_test)
-    accuracy = clf.score(X_test, y_test)
+    # prepare training data (exclude noise if any)
+    valid_idx = np.where(cluster_labels != -1)[0]
+    if len(valid_idx) >= 2:
+        X_valid = X_scaled[valid_idx]
+        y_valid = cluster_labels[valid_idx]
+        try:
+            X_train, X_test, y_train, y_test = train_test_split(X_valid, y_valid, test_size=0.2, random_state=42)
+            clf = RandomForestClassifier(n_estimators=100, random_state=42)
+            clf.fit(X_train, y_train)
+            accuracy = clf.score(X_test, y_test)
+            st.metric("Classifier Accuracy", f"{accuracy * 100:.2f}%")
 
-    st.metric("Classifier Accuracy", f"{accuracy * 100:.2f}%")
+            # Confusion matrix
+            y_pred = clf.predict(X_test)
+            fig_cm, ax_cm = plt.subplots()
+            cm = confusion_matrix(y_test, y_pred)
+            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax_cm)
+            ax_cm.set_xlabel("Predicted")
+            ax_cm.set_ylabel("True")
+            ax_cm.set_title("Confusion Matrix")
+            st.pyplot(fig_cm)
 
-    fig_cm, ax_cm = plt.subplots()
-    cm = confusion_matrix(y_test, y_pred)
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax_cm)
-    ax_cm.set_xlabel("Predicted")
-    ax_cm.set_ylabel("True")
-    ax_cm.set_title("Confusion Matrix")
-    st.pyplot(fig_cm)
+            # Input fields for single prediction
+            st.markdown("**Predict segment for a new single customer**")
+            income = st.number_input("Annual Income (k$)", min_value=1.0, max_value=100000.0, value=60.0, step=1.0)
+            score = st.number_input("Spending Score (1-100)", min_value=0.0, max_value=100.0, value=50.0, step=1.0)
+            gender = st.selectbox("Gender", ["Female", "Male"])
+            age = st.number_input("Age", min_value=1, max_value=120, value=30, step=1)
 
-    # Input fields
-    income = st.number_input("Annual Income (k$)", min_value=10, max_value=150, value=60)
-    score = st.number_input("Spending Score (1-100)", min_value=1, max_value=100, value=50)
-    gender = st.selectbox("Gender", ["Female", "Male"])
-    age = st.number_input("Age", min_value=18, max_value=80, value=30)
+            # Prepare input row consistent with features
+            spi = (score / income) if income != 0 else 0
+            age_group_label = pd.cut([age], bins=[0, 30, 45, 60, 120], labels=['Young', 'Adult', 'Mid-Aged', 'Senior'])[0]
 
-    # Derived inputs
-    spi = score / income
-    age_group = pd.cut([age], bins=[18, 30, 45, 60, 80], labels=['Young', 'Adult', 'Mid-Aged', 'Senior'])[0]
+            # Construct input record aligned to features
+            input_data = {}
+            for f in features:
+                if f == 'Annual Income (k$)':
+                    input_data[f] = income
+                elif f == 'Spending Score (1-100)':
+                    input_data[f] = score
+                elif f == 'Spending per Income':
+                    input_data[f] = spi
+                elif f.startswith('Gender_'):
+                    # e.g., Gender_Male -> set 1 for Male when selected
+                    if f == f"Gender_{gender}":
+                        input_data[f] = 1
+                    else:
+                        input_data[f] = 0
+                elif f.startswith('Age Group_'):
+                    # map label names to column format used earlier 'Age Group_Adult'
+                    col_label = f.replace('Age Group_', '')
+                    if str(age_group_label) == col_label:
+                        input_data[f] = 1
+                    else:
+                        input_data[f] = 0
+                else:
+                    input_data[f] = 0
 
-    input_data = {
-        'Annual Income (k$)': income,
-        'Spending Score (1-100)': score,
-        'Spending per Income': spi,
-        'Gender_Male': 1 if gender == 'Male' else 0,
-        'Age Group_Adult': 1 if age_group == 'Adult' else 0,
-        'Age Group_Mid-Aged': 1 if age_group == 'Mid-Aged' else 0,
-        'Age Group_Senior': 1 if age_group == 'Senior' else 0
-    }
-    for col in features:
-        if col not in input_data:
-            input_data[col] = 0
+            input_df = pd.DataFrame([input_data])
+            input_scaled = scaler.transform(input_df[features])
+            predicted_cluster = clf.predict(input_scaled)[0]
+            st.success(f"Predicted Segment: Cluster {predicted_cluster} — {default_personas.get(predicted_cluster, 'Unknown')}")
+        except Exception as e:
+            st.error(f"Unable to train classifier or predict: {e}")
+    else:
+        st.info("Not enough valid labeled samples to train a classifier (after excluding noise).")
 
-    input_df = pd.DataFrame([input_data])
-    input_scaled = scaler.transform(input_df[features])
-    predicted_cluster = clf.predict(input_scaled)[0]
-
-    st.success(f"Predicted Segment: Cluster {predicted_cluster} — {personas.get(predicted_cluster, 'Unknown')}")
-
+# ---------------------------
 # Optionally Show Raw Data
+# ---------------------------
 if st.checkbox("Show Raw Data"):
-    st.dataframe(df)
-
-# Run StreaLit App
-# streamlit run dashboard.py
+    st.dataframe(df.reset_index(drop=True))

@@ -1,18 +1,8 @@
-# Core
 streamlit==1.26.0
-
-# Data & ML
 pandas
 numpy
 scikit-learn
 scipy
 joblib
-
-# Visualization
-matplotlib==3.6.2
-# Pin a Pillow that has wheels and avoids building from source
-Pillow==9.4.0
-seaborn
-
-# Optional extras (small, helpful)
+plotly
 altair
